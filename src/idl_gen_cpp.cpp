@@ -20,6 +20,7 @@
 
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -441,6 +442,12 @@ class CppGenerator : public BaseGenerator {
 
     if (opts_.gen_nullable) { code_ += "#pragma clang system_header\n\n"; }
 
+    if (opts_.g_cpp_std >= cpp::CPP_STD_17) {
+      // TODO: It would be nice to only add this if we have a union.
+      code_ += "#include <variant>";
+      code_ += "";
+    }
+
     code_ += "#include \"flatbuffers/flatbuffers.h\"";
     if (parser_.uses_flexbuffers_) {
       code_ += "#include \"flatbuffers/flexbuffers.h\"";
@@ -777,10 +784,10 @@ class CppGenerator : public BaseGenerator {
       if (type.enum_def) return WrapInNameSpace(*type.enum_def);
       if (type.base_type == BASE_TYPE_BOOL) return "bool";
     }
-    // Get real underlying type for union type 
+    // Get real underlying type for union type
     auto base_type = type.base_type;
     if (type.base_type == BASE_TYPE_UTYPE && type.enum_def != nullptr) {
-        base_type = type.enum_def->underlying_type.base_type;
+      base_type = type.enum_def->underlying_type.base_type;
     }
     return StringOf(base_type);
   }
@@ -1051,7 +1058,9 @@ class CppGenerator : public BaseGenerator {
 
   std::string UnionVectorVerifySignature(const EnumDef &enum_def) {
     const std::string name = Name(enum_def);
-    const std::string &type = opts_.scoped_enums ? name : GenTypeBasic(enum_def.underlying_type, false); 
+    const std::string &type =
+        opts_.scoped_enums ? name
+                           : GenTypeBasic(enum_def.underlying_type, false);
     return "bool Verify" + name + "Vector" +
            "(::flatbuffers::Verifier &verifier, " +
            "const ::flatbuffers::Vector<::flatbuffers::Offset<void>> "
@@ -1339,6 +1348,13 @@ class CppGenerator : public BaseGenerator {
         code_ += "};";
         code_ += "";
       }
+    }
+    if (enum_def.is_union && opts_.g_cpp_std >= cpp::CPP_STD_17) {
+      // Generate a using statement for the variant of this union, since the
+      // type name could be excessively long given many member values.
+      code_ += "using " + Name(enum_def) +
+               "Variant = " + GetUnionVariantType(enum_def) + ";";
+      code_ += "";
     }
 
     GenEnumObjectBasedAPI(enum_def);
@@ -2484,6 +2500,29 @@ class CppGenerator : public BaseGenerator {
     code_ += "  }";
   }
 
+  std::string GetUnionVariantType(const EnumDef &enum_def) {
+    // The set of unique types of the union, starting with monostate to
+    // represent the empty/NONE state.
+    std::set<std::string> unique_types{ "std::monostate" };
+
+    // Find all the unique types of this union.
+    for (const auto &ev : enum_def.Vals()) {
+      if (ev->union_type.base_type != BASE_TYPE_NONE) {
+        unique_types.emplace("const " + GetUnionElement(*ev, false, opts_) +
+                             " *");
+      }
+    }
+
+    // Join the unique types into a variant.
+    return "std::variant<" +
+           std::accumulate(
+               unique_types.cbegin(), unique_types.cend(), std::string{},
+               [](const std::string &a, const std::string &b) -> std::string {
+                 return a + (a.length() > 0 ? ",\n" : "\n") + "  " + b;
+               }) +
+           ">";
+  }
+
   void GenTableUnionAsGetters(const FieldDef &field) {
     const auto &type = field.value.type;
     auto u = type.enum_def;
@@ -2492,6 +2531,35 @@ class CppGenerator : public BaseGenerator {
       code_ +=
           "  template<typename T> "
           "const T *{{NULLABLE_EXT}}{{FIELD_NAME}}_as() const;";
+
+    if (opts_.g_cpp_std >= CPP_STD_17) {
+      code_.SetValue("VARIANT_TYPE_NAME", Name(*u) + "Variant");
+
+      code_ += "  {{VARIANT_TYPE_NAME}} {{FIELD_NAME}}_variant() const {";
+      code_ += "    switch({{FIELD_NAME}}_type()) {";
+
+      for (const auto &ev : u->Vals()) {
+        code_.SetValue(
+            "U_ELEMENT_TYPE",
+            WrapInNameSpace(u->defined_namespace, GetEnumValUse(*u, *ev)));
+
+        if (ev->union_type.base_type == BASE_TYPE_NONE) {
+          // Skip handling NONE type by breaking and returning monostate below.
+          code_ += "      case {{U_ELEMENT_TYPE}}: break;";
+          continue;
+        }
+
+        code_.SetValue("U_FIELD_TYPE",
+                       "const " + GetUnionElement(*ev, false, opts_) + " *");
+        code_ +=
+            "      case {{U_ELEMENT_TYPE}}: return "
+            "static_cast<{{U_FIELD_TYPE}}>({{FIELD_NAME}}());";
+      }
+      code_ += "    }";
+      // Return the monostate for empty unions.
+      code_ += "    return std::monostate{};";
+      code_ += "  }";
+    }
 
     for (auto u_it = u->Vals().begin(); u_it != u->Vals().end(); ++u_it) {
       auto &ev = **u_it;
@@ -3505,7 +3573,8 @@ class CppGenerator : public BaseGenerator {
                                           : underlying_type;
             auto enum_value = "__va->_" + value + "[i].type";
             if (!opts_.scoped_enums)
-              enum_value = "static_cast<" + underlying_type + ">(" + enum_value + ")";
+              enum_value =
+                  "static_cast<" + underlying_type + ">(" + enum_value + ")";
 
             code += "_fbb.CreateVector<" + type + ">(" + value +
                     ".size(), [](size_t i, _VectorArgs *__va) { return " +
